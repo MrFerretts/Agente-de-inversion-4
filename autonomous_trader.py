@@ -27,6 +27,8 @@ import numpy as np
 import pytz
 import requests
 
+from market_data import MarketDataFetcher
+
 logger = logging.getLogger("PatoQuant.Trader")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,9 +37,15 @@ logger = logging.getLogger("PatoQuant.Trader")
 # ─────────────────────────────────────────────────────────────────────────────
 
 RISK_CONFIG = {
-    # ── Tamaño de posición ────────────────────────────────────────────────────
-    "position_pct":        0.08,    # 8% del portafolio por trade (riesgo en ATR)
-    "max_position_pct":    0.20,    # Hasta 20% en un solo activo
+    # ── Tamaño de posición (riesgo por trade, no % fijo de equity) ────────────
+    # FIX 2026: "position_pct" (antes 8%) presupuestaba el riesgo en dólares,
+    # pero combinado con stops típicos de ATR*1.5 (~1.5-3% del precio) el qty
+    # resultante superaba max_position_pct casi siempre → en la práctica TODAS
+    # las posiciones terminaban en el tope fijo del 20%, sin importar volatilidad.
+    # Bajamos el riesgo objetivo por trade para que el tamaño real escale con
+    # la distancia al stop (más volátil / stop más ancho → posición más chica).
+    "risk_pct_per_trade":  0.005,   # 0.5% del equity arriesgado por trade
+    "max_position_pct":    0.20,    # Techo de concentración: máx 20% en un activo
     "min_position_usd":    50.0,    # Mínimo $50 por trade (evitar comisiones)
 
     # ── Stop Loss / Take Profit dinámicos (basados en ATR) ────────────────────
@@ -45,6 +53,13 @@ RISK_CONFIG = {
     "take_profit_atr_mult": 3.0,    # TP   = precio_entrada + (ATR * 3.0) → R:R 1:2
     "trailing_stop":       True,    # Activar trailing stop
     "trailing_atr_mult":   1.2,     # Trailing = precio_max - (ATR * 1.2)
+
+    # ── Reward:Risk escalado por convicción (Prioridad 4 — EXPLORATORIO) ──────
+    # Desactivado por defecto: mientras no haya más muestra, el ratio se
+    # mantiene fijo en 2:1 tal como se pidió. Activar solo para testear.
+    "conviction_scaled_rr": False,
+    "conviction_rr_high_mult": 1.5,   # score>=70 y ML>=70% → TP a 3:1
+    "conviction_rr_low_mult":  0.75,  # score cerca del mínimo → TP a 1.5:1
 
     # ── Filtros de entrada ────────────────────────────────────────────────────
     "min_score":           35,      # Score técnico mínimo (antes 55 — casi nada pasaba)
@@ -58,12 +73,33 @@ RISK_CONFIG = {
     "max_daily_loss_pct":  0.05,    # Pausar si pierde 5% en el día
     "max_total_exposure":  0.90,    # Máximo 90% del portafolio invertido
 
+    # ── Time stop (Prioridad 2) ─────────────────────────────────────────────
+    # Evita capital estancado en posiciones sin momentum (el problema real
+    # observado en v3: ~5 meses sin tocar TP/SL por ADX y RVOL bajos).
+    "time_stop_days":      21,      # A partir de aquí se evalúa cierre anticipado
+    "time_stop_max_adx":   18,      # ...si además ADX sigue débil (igual a min_adx de entrada)
+    "time_stop_max_rvol":  1.0,     # ...y sin volumen relativo
+    "time_stop_min_gain_pct": 5.0,  # ...y sin ganancia relevante todavía
+    "max_holding_days":    45,      # Cierre forzado pase lo que pase (tope duro)
+
     # ── Cooldown ─────────────────────────────────────────────────────────────
     "trade_cooldown_hours": 2,      # 2h cooldown (antes 4h — perdía re-entradas)
     "max_trades_per_day":  15,      # Máximo 15 operaciones por día
 
     # ── Correlación sectorial ────────────────────────────────────────────────
     "max_positions_per_sector": 3,  # Máximo 3 posiciones en el mismo sector
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIZING POR VIX (Prioridad 3) — mismos umbrales que consensus_analyzer.py
+# para mantener consistencia en todo el sistema sobre qué es "VIX alto".
+# ─────────────────────────────────────────────────────────────────────────────
+
+VIX_SIZE_MULTIPLIERS = {
+    "RISK_ON":  1.00,   # VIX < 19  — mercado tranquilo, tamaño normal
+    "NEUTRAL":  0.75,   # VIX 19-25 — algo de cautela
+    "RISK_OFF": 0.50,   # VIX 25-35 — reducir posiciones a la mitad
+    "CRISIS":   0.25,   # VIX > 35  — muy conservador, solo posiciones pequeñas
 }
 
 
@@ -338,6 +374,11 @@ class TradingBrain:
         self.daily_pnl     = 0.0
         self.peak_equity   = None
         self.last_trade_time: Dict[str, datetime] = {}
+        self.position_opened_at: Dict[str, datetime] = {}   # ← time stop (P2)
+
+        # Régimen de mercado / VIX, refrescado 1x por ciclo (P3)
+        self.market_fetcher = MarketDataFetcher({})
+        self.current_regime: Dict = {"regime": "NEUTRAL", "vix": None}
 
         # Cargar estado persistente (sobrevive restarts de Railway)
         self._load_state()
@@ -367,6 +408,12 @@ class TradingBrain:
                         self.last_trade_time[ticker] = datetime.fromisoformat(ts)
                     except Exception:
                         pass
+                # Restaurar fechas de apertura de posición (para el time stop)
+                for ticker, ts in state.get("position_opened_at", {}).items():
+                    try:
+                        self.position_opened_at[ticker] = datetime.fromisoformat(ts)
+                    except Exception:
+                        pass
                 logger.info(f"📂 Estado del trader restaurado (peak: ${self.peak_equity or 0:,.2f})")
         except Exception as e:
             logger.debug(f"No se pudo cargar estado: {e}")
@@ -382,6 +429,9 @@ class TradingBrain:
                 "trade_history": self.trade_history,
                 "last_trade_time": {
                     k: v.isoformat() for k, v in self.last_trade_time.items()
+                },
+                "position_opened_at": {
+                    k: v.isoformat() for k, v in self.position_opened_at.items()
                 },
                 "saved_at": datetime.now().isoformat(),
             }
@@ -491,28 +541,54 @@ class TradingBrain:
 
         return True, f"Score={composite:.0f} | RSI={rsi:.1f} | ADX={adx:.1f} | ML={ml_confidence*100:.0f}%"
 
+    # ── Régimen de mercado / VIX (Prioridad 3) ────────────────────────────────
+
+    def refresh_market_regime(self):
+        """Refresca el régimen de mercado (VIX) una vez por ciclo de trading."""
+        try:
+            self.current_regime = self.market_fetcher.get_market_regime()
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo refrescar régimen de mercado: {e}")
+
+    def get_vix_size_multiplier(self) -> float:
+        """Multiplicador de tamaño de posición según el régimen de VIX actual."""
+        regime = self.current_regime.get("regime", "NEUTRAL")
+        return VIX_SIZE_MULTIPLIERS.get(regime, 0.75)
+
     # ── Tamaño de posición ────────────────────────────────────────────────────
 
     def calculate_position_size(self, ticker: str, price: float,
-                                  atr: float) -> Tuple[float, float, float]:
+                                  atr: float,
+                                  conviction_rr_mult: float = 1.0
+                                  ) -> Tuple[float, float, float]:
         """
-        Calcula tamaño de posición usando volatilidad (ATR).
+        Calcula tamaño de posición usando volatilidad (ATR) — riesgo por trade,
+        no % fijo de equity.
 
         Método: Risk-based position sizing
-          - Arriesgar N% del portafolio por trade
+          - Arriesgar N% del portafolio por trade (ajustado por régimen de VIX)
           - Stop loss = ATR * multiplicador
-          - Qty = (portafolio * risk_pct) / stop_distance
+          - Qty = (portafolio * risk_pct * vix_mult) / stop_distance
+
+        A mayor distancia al stop (más volatilidad), MENOR el tamaño en dólares,
+        para arriesgar aproximadamente el mismo % de la cuenta en cada trade.
 
         Retorna: (qty, stop_loss_price, take_profit_price)
         """
         portfolio_value = self.alpaca.get_portfolio_value()
 
-        # Riesgo en dólares = 5% del portafolio
-        risk_dollars = portfolio_value * RISK_CONFIG["position_pct"]
+        vix_mult = self.get_vix_size_multiplier()
+
+        # Riesgo en dólares = risk_pct_per_trade del portafolio, ajustado por VIX
+        risk_dollars = portfolio_value * RISK_CONFIG["risk_pct_per_trade"] * vix_mult
 
         # Stop distance basado en ATR
         stop_distance   = atr * RISK_CONFIG["stop_loss_atr_mult"]
         profit_distance = atr * RISK_CONFIG["take_profit_atr_mult"]
+
+        # Reward:Risk escalado por convicción (P4 — exploratorio, off por defecto)
+        if RISK_CONFIG["conviction_scaled_rr"]:
+            profit_distance *= conviction_rr_mult
 
         # Evitar divisiones por cero
         if stop_distance < 0.01:
@@ -521,7 +597,8 @@ class TradingBrain:
         # Número de acciones que podemos comprar arriesgando risk_dollars
         qty = risk_dollars / stop_distance
 
-        # Verificar que no exceda max_position_pct del portafolio
+        # Verificar que no exceda max_position_pct del portafolio (techo de
+        # concentración, no el driver principal del tamaño — ver RISK_CONFIG)
         max_value = portfolio_value * RISK_CONFIG["max_position_pct"]
         qty = min(qty, max_value / price)
 
@@ -591,6 +668,35 @@ class TradingBrain:
         if current_val >= tp_price:
             return True, f"Take profit alcanzado (+{unrealized:.1f}% | TP {tp_price:.2f})"
 
+        # ── Time stop (Prioridad 2) ───────────────────────────────────────────
+        # Evita capital estancado en posiciones sin momentum, ni TP ni SL.
+        adx  = float(scan_result.get("adx", 0))
+        rvol = float(scan_result.get("rvol", 1))
+        opened_at = self.position_opened_at.get(symbol)
+
+        if opened_at is not None:
+            days_held = (datetime.now() - opened_at).days
+
+            # Tope duro: cierre forzado sin importar nada más
+            if days_held >= RISK_CONFIG["max_holding_days"]:
+                return True, (
+                    f"Time stop máximo alcanzado ({days_held}d ≥ "
+                    f"{RISK_CONFIG['max_holding_days']}d) — cierre forzado, "
+                    f"{unrealized:+.1f}%"
+                )
+
+            # Tope suave: solo si además no hay momentum (el patrón real de v3:
+            # ADX bajo + RVOL bajo) y la ganancia todavía no es relevante
+            if (days_held >= RISK_CONFIG["time_stop_days"]
+                    and adx < RISK_CONFIG["time_stop_max_adx"]
+                    and rvol < RISK_CONFIG["time_stop_max_rvol"]
+                    and unrealized < RISK_CONFIG["time_stop_min_gain_pct"]):
+                return True, (
+                    f"Time stop: {days_held}d sin momentum "
+                    f"(ADX {adx:.1f} | RVOL {rvol:.2f}x | {unrealized:+.1f}%) "
+                    f"— capital estancado, replanteando"
+                )
+
         # ── Señal técnica bajista fuerte ──────────────────────────────────────
         if rec in ("VENTA", "VENTA FUERTE") and score <= -30:
             return True, f"Señal bajista fuerte (Score {score:.0f})"
@@ -648,6 +754,13 @@ class TradingBrain:
                   price: float, reason: str):
         """Registra operación en el historial y persiste a disco."""
         self.last_trade_time[ticker] = datetime.now()
+
+        # Trackear apertura/cierre de posición para el time stop (P2)
+        if action == "BUY":
+            self.position_opened_at[ticker] = datetime.now()
+        elif action == "SELL":
+            self.position_opened_at.pop(ticker, None)
+
         self.trade_history.append({
             "date":   datetime.now().strftime("%Y-%m-%d"),
             "time":   datetime.now().strftime("%H:%M:%S"),
@@ -685,8 +798,9 @@ class AutonomousTrader:
             self.brain  = TradingBrain(self.alpaca)
             self.active = True
             logger.info("💰 Motor de Trading Autónomo inicializado (Paper Trading)")
-            logger.info(f"   Capital por trade: {RISK_CONFIG['position_pct']*100:.0f}% del portafolio")
+            logger.info(f"   Riesgo por trade: {RISK_CONFIG['risk_pct_per_trade']*100:.2f}% del equity (x VIX mult)")
             logger.info(f"   Stop/TP: {RISK_CONFIG['stop_loss_atr_mult']}x ATR / {RISK_CONFIG['take_profit_atr_mult']}x ATR")
+            logger.info(f"   Time stop: {RISK_CONFIG['time_stop_days']}d (soft) / {RISK_CONFIG['max_holding_days']}d (hard)")
         except Exception as e:
             self.active = False
             logger.error(f"❌ No se pudo inicializar Alpaca: {e}")
@@ -709,6 +823,15 @@ class AutonomousTrader:
         logger.info("💰 Iniciando ciclo de trading autónomo...")
 
         try:
+            # ── Paso 0: Refrescar régimen de mercado (VIX) para sizing ────────
+            self.brain.refresh_market_regime()
+            regime = self.brain.current_regime
+            logger.info(
+                f"   🌡️ Régimen: {regime.get('regime', 'N/A')} "
+                f"(VIX {regime.get('vix', 0):.1f} | "
+                f"tamaño x{self.brain.get_vix_size_multiplier():.2f})"
+            )
+
             # ── Paso 1: Gestionar posiciones existentes ───────────────────────
             self._manage_open_positions(scan_results)
 
@@ -739,6 +862,12 @@ class AutonomousTrader:
             qty     = float(position.get("qty", 0))
             pnl_pct = float(position.get("unrealized_plpc", 0)) * 100
             price   = float(position.get("current_price", 0))
+
+            # Posición sin fecha de apertura registrada (p.ej. abierta antes de
+            # existir el time stop, o tras un restart sin estado persistido):
+            # sembrar "ahora" para no dispararlo de inmediato.
+            if ticker not in self.brain.position_opened_at:
+                self.brain.position_opened_at[ticker] = datetime.now()
 
             scan = scan_map.get(ticker)
             if not scan:
@@ -793,20 +922,35 @@ class AutonomousTrader:
             if price <= 0:
                 continue
 
-            # Obtener predicción ML si hay modelo entrenado
+            # Predicción ML: ya viene calculada correctamente desde
+            # scheduler.py::_analyze_ticker (usa el modelo real .predict() con
+            # el DataFrame completo). FIX: antes se intentaba llamar un método
+            # predict_latest() que no existe en AdvancedTradingMLModel — el
+            # error quedaba silenciado por un except genérico y ml_result
+            # siempre era None, por lo que ML nunca contribuía a la decisión
+            # (de ahí el "ML=0%" en todos los logs de trades).
             ml_result = None
-            if ticker in ml_models:
-                try:
-                    ml_result = ml_models[ticker].predict_latest(result)
-                except Exception:
-                    pass
+            if result.get("ml_prob_up") is not None:
+                ml_result = {
+                    "probability_up": result["ml_prob_up"],
+                    "recommendation": result.get("ml_rec"),
+                }
 
             # ¿Debemos comprar?
             should_buy, reason = self.brain.should_buy(ticker, result, ml_result)
 
             if should_buy:
+                # Convicción compuesta para el reward:risk exploratorio (P4)
+                ml_conf = float(ml_result.get("probability_up", 0.5)) if ml_result else 0.5
+                if score >= 70 and ml_conf >= 0.70:
+                    conviction_mult = RISK_CONFIG["conviction_rr_high_mult"]
+                elif score <= RISK_CONFIG["min_score"] + 10:
+                    conviction_mult = RISK_CONFIG["conviction_rr_low_mult"]
+                else:
+                    conviction_mult = 1.0
+
                 qty, stop_loss, take_profit = self.brain.calculate_position_size(
-                    ticker, price, atr
+                    ticker, price, atr, conviction_rr_mult=conviction_mult
                 )
 
                 logger.info(
