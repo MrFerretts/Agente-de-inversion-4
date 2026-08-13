@@ -12,17 +12,16 @@ import os
 
 from core.state_manager import StateManager, DataProcessor
 from core.risk_manager import RiskManager
-from ui.chart_builder import ChartBuilder
 from market_data import MarketDataFetcher
 from technical_analysis import TechnicalAnalyzer
-from notifications import NotificationManager
 from groq import Groq
 from ml_model import TradingMLModel, train_ml_model_for_ticker, get_ml_prediction, format_ml_output
-from portfolio_tracker import PortfolioTracker, display_portfolio_dashboard
-from auto_monitoring import AutoMonitoringSystem, setup_auto_monitoring, display_monitoring_controls
 from consensus_analyzer import ConsensusAnalyzer, get_consensus_analysis
-from auto_trader import AutoTrader, AlpacaConnector, SafetyManager
-from pairs_trading import PairsFinder, PairsTrader, get_classic_pairs
+# NOTA (limpieza v4): portfolio_tracker, auto_monitoring, notifications, auto_trader
+# (módulo) y pairs_trading no existen en este repo (sí en Agente-de-Inversión-2).
+# Se removieron los imports y las secciones de UI que dependían de ellos —
+# el motor de trading real de v4 vive en scheduler.py + autonomous_trader.py
+# y no depende de nada de este archivo, que es solo un dashboard manual.
 # ============================================================================
 # CONFIGURACIÓN INICIAL
 # ============================================================================
@@ -89,30 +88,17 @@ except:
 if 'state_manager' not in st.session_state:
     st.session_state.state_manager = StateManager(cache_ttl_seconds=300)
     st.session_state.risk_manager = RiskManager()
-    st.session_state.chart_builder = ChartBuilder()
     st.session_state.fetcher = MarketDataFetcher(API_CONFIG)
     st.session_state.analyzer = TechnicalAnalyzer(TECHNICAL_INDICATORS)
-    st.session_state.notifier = NotificationManager({'NOTIFICATIONS': NOTIFICATIONS})
-
 
     # 🤖 ESTO DEBE QUEDAR AFUERA (Línea ~60 aprox)
 if 'ml_models' not in st.session_state:
     st.session_state.ml_models = {}
 
-# Portfolio Tracker
-if 'portfolio_tracker' not in st.session_state:
-    st.session_state.portfolio_tracker = PortfolioTracker(data_file="data/portfolio.json")
-
-portfolio_tracker = st.session_state.portfolio_tracker
-
-
-
 state_mgr = st.session_state.state_manager
 risk_mgr = st.session_state.risk_manager
-chart_builder = st.session_state.chart_builder
 fetcher = st.session_state.fetcher
 analyzer = st.session_state.analyzer
-notifier = st.session_state.notifier
 
 # --- MOVIDO HACIA ARRIBA PARA EVITAR NAMEERROR ---
 import json
@@ -134,29 +120,10 @@ if 'mis_activos' not in st.session_state:
 # Definimos lista_completa AQUÍ para que el Streamer pueda leerla
 lista_completa = st.session_state.mis_activos['stocks'] + st.session_state.mis_activos['crypto']
 
-# ============================================================================
-# INICIALIZAR AUTO-TRADER (CONEXIÓN ALPACA)
-# ============================================================================
-if 'auto_trader' not in st.session_state:
-    try:
-        # Busca las llaves en tus secrets de Streamlit
-        alpaca_sec = st.secrets.get("ALPACA", {})
-        if alpaca_sec:
-            st.session_state.auto_trader = AutoTrader(
-                alpaca_api_key=alpaca_sec.get("api_key"),
-                alpaca_secret=alpaca_sec.get("api_secret"),
-                consensus_analyzer=ConsensusAnalyzer(),
-                portfolio_tracker=portfolio_tracker,
-                paper_trading=alpaca_sec.get("paper_trading", True)
-            )
-        else:
-            st.session_state.auto_trader = None
-    except Exception as e:
-        st.error(f"⚠️ Error inicializando Alpaca: {str(e)}")
-        st.session_state.auto_trader = None
-
-# Definir la variable global para que la Tab 8 la reconozca
-auto_trader = st.session_state.auto_trader
+# NOTA: la pestaña de Auto-Trading manual (antes Tab 8) se removió — dependía
+# del módulo auto_trader.py (distinto de autonomous_trader.py) que no existe
+# en este repo. El trading autónomo real corre en scheduler.py, fuera de
+# Streamlit; ver dashboard.py para verlo en vivo desde Supabase.
 
 # ============================================================================
 # UI HELPER: CREAR TARJETAS MÉTRICAS
@@ -635,16 +602,16 @@ with st.spinner("Analizando contexto macro..."):
 # TABS PRINCIPALES
 # ============================================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+# NOTA (limpieza v4): se removieron las pestañas "Mi Portfolio", "Auto-Trading"
+# y "Pairs Trading" — dependían de portfolio_tracker.py, auto_trader.py y
+# pairs_trading.py, que no existen en este repo (ver notas de import arriba).
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Dashboard Principal",
     "📈 Análisis Técnico Avanzado",
     "💰 Risk Management",
     "🧪 Backtesting Pro",
     "🔍 Scanner Multi-Activo",
     "🤖 Machine Learning",
-    "💼 Mi Portfolio",
-    "🤖 Auto-Trading",
-    "⚖️ Pairs Trading"
 ])
 
 # ============================================================================
@@ -666,8 +633,23 @@ with tab1:
 
     with col_main:
         st.subheader(f"📊 Análisis Técnico: {ticker}")
-        fig = chart_builder.create_multi_indicator_chart(data_processed, ticker, show_signals=False)
-        fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        # NOTA: antes usaba ui/chart_builder.py (no existe en este repo) —
+        # reemplazado por un candlestick + SMA20/50 inline con Plotly directo.
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=data_processed.index, open=data_processed['Open'],
+            high=data_processed['High'], low=data_processed['Low'],
+            close=data_processed['Close'], name=ticker
+        ))
+        if 'SMA20' in data_processed.columns:
+            fig.add_trace(go.Scatter(x=data_processed.index, y=data_processed['SMA20'],
+                                      line=dict(color='#f39c12', width=1), name='SMA20'))
+        if 'SMA50' in data_processed.columns:
+            fig.add_trace(go.Scatter(x=data_processed.index, y=data_processed['SMA50'],
+                                      line=dict(color='#3498db', width=1), name='SMA50'))
+        fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)',
+                          plot_bgcolor='rgba(0,0,0,0)', height=500,
+                          xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
         # Botón de Groq original
@@ -1478,13 +1460,10 @@ with tab5:
             hide_index=True
         )
         
-        # Botón de Email corregido para usar los datos guardados
-        st.markdown("---")
-        if st.button("📧 Enviar Reporte por Email"):
-            with st.spinner("Enviando reporte..."):
-                macro_info = fetcher.get_market_regime()
-                notifier.send_full_report(df_summary=df_res, macro_info=macro_info)
-                st.success("✅ ¡Reporte de 13 indicadores enviado!")
+        # NOTA: el botón de "Enviar Reporte por Email" dependía de
+        # notifications.py (no existe en este repo) — removido. Las alertas
+        # reales de v4 las manda scheduler.py (Telegram/email) del lado del
+        # servidor, no este dashboard manual.
 
         # ================================================================
         # 🌟 SELECCIÓN MAESTRA DE IA — resultado automático del pipeline
@@ -1624,357 +1603,14 @@ with tab6:
                 st.rerun()
 
 # ============================================================================
-# TAB 7: MI PORTFOLIO
+# TABS REMOVIDAS EN LA LIMPIEZA v4 (dependian de modulos que no existen aqui):
+#   - "Mi Portfolio"  -> portfolio_tracker.py
+#   - "Auto-Trading"  -> auto_trader.py (modulo distinto de autonomous_trader.py,
+#                        que si existe y es el motor de trading real de v4)
+#   - "Pairs Trading" -> pairs_trading.py
+# Ninguno existe en Agente-de-Inversion-4 (si en Agente-de-Inversion-2).
+# El trading autonomo real corre en scheduler.py, fuera de este dashboard.
 # ============================================================================
-
-with tab7:
-    st.header("💼 Mi Portfolio & Trading Journal")
-    
-    # Obtener precios actuales de los primeros 10 tickers de la watchlist
-    current_prices = {}
-    with st.spinner("Actualizando precios..."):
-        for symbol in lista_completa[:10]:  # Solo primeros 10 para no tardar mucho
-            try:
-                data_symbol = fetcher.get_portfolio_data([symbol], period='1d')[symbol]
-                if not data_symbol.empty:
-                    current_prices[symbol] = data_symbol['Close'].iloc[-1]
-            except:
-                pass
-    
-    # Mostrar dashboard completo del portfolio
-    display_portfolio_dashboard(portfolio_tracker, current_prices)
-    
-    # Sección para abrir nueva posición
-    st.markdown("---")
-    st.subheader("➕ Abrir Nueva Posición")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        new_ticker = st.selectbox("Ticker", lista_completa, key='new_position_ticker')
-        new_shares = st.number_input("Número de Acciones", min_value=1, value=10, key='new_position_shares')
-    
-    with col2:
-        # Obtener precio actual del ticker seleccionado
-        try:
-            data_current = fetcher.get_portfolio_data([new_ticker], period='1d')[new_ticker]
-            current_price_new = data_current['Close'].iloc[-1]
-        except:
-            current_price_new = 100.0
-        
-        new_entry = st.number_input(
-            "Precio de Entrada", 
-            value=float(current_price_new), 
-            format="%.2f",
-            key='new_position_entry'
-        )
-        
-        new_stop = st.number_input(
-            "Stop Loss", 
-            value=float(current_price_new * 0.95),  # -5% default
-            format="%.2f",
-            key='new_position_stop'
-        )
-    
-    with col3:
-        new_target = st.number_input(
-            "Take Profit", 
-            value=float(current_price_new * 1.10),  # +10% default
-            format="%.2f",
-            key='new_position_target'
-        )
-        
-        new_strategy = st.text_input(
-            "Estrategia/Notas", 
-            value="Manual", 
-            key='new_position_strategy'
-        )
-    
-    # Botón para abrir posición
-    if st.button("✅ Abrir Posición", use_container_width=True, type="primary"):
-        try:
-            position = portfolio_tracker.add_position(
-                ticker=new_ticker,
-                entry_price=new_entry,
-                shares=new_shares,
-                stop_loss=new_stop,
-                take_profit=new_target,
-                strategy=new_strategy,
-                notes=f"Abierta desde Pato Terminal el {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-            
-            st.success(f"✅ Posición abierta: {new_ticker} ({new_shares} shares @ ${new_entry:.2f})")
-            st.balloons()
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"❌ Error abriendo posición: {str(e)}")
-    
-    # Cálculo de riesgo estimado
-    risk_per_share = abs(new_entry - new_stop)
-    total_risk = risk_per_share * new_shares
-    position_size = new_entry * new_shares
-    risk_pct = (total_risk / position_size) * 100 if position_size > 0 else 0
-    
-    st.caption(f"💡 Riesgo estimado: ${total_risk:.2f} ({risk_pct:.2f}% de la posición)")
-
-# ============================================================================
-# TAB 8: AUTO-TRADING
-# ============================================================================
-
-with tab8:
-    st.header("🤖 Sistema de Auto-Trading")
-    
-    if auto_trader is None:
-        st.error("❌ Auto-Trader no está configurado")
-        st.markdown("""
-        ### Pasos para configurar:
-        1. Crear cuenta en Alpaca Markets
-        2. Obtener API keys (Paper Trading)
-        3. Agregar keys a Secrets:
-           ```
-           [ALPACA]
-           api_key = "pk_xxx"
-           api_secret = "xxx"
-           paper_trading = true
-           ```
-        4. Reiniciar app
-        """)
-        st.stop()
-    
-    # Mostrar estado
-    st.markdown("---")
-    
-    # Modo (Paper o Live)
-    mode_emoji = "📝" if auto_trader.paper_mode else "💰"
-    mode_text = "PAPER TRADING" if auto_trader.paper_mode else "LIVE TRADING"
-    mode_color = "#f39c12" if auto_trader.paper_mode else "#e74c3c"
-    
-    st.markdown(f"""
-    <div style='padding: 15px; background-color: {mode_color}20; border-left: 5px solid {mode_color}; margin-bottom: 20px;'>
-        <h3 style='margin: 0;'>{mode_emoji} Modo: {mode_text}</h3>
-        <p>{'Simulación - No se usa dinero real' if auto_trader.paper_mode else '⚠️ DINERO REAL - Ten precaución'}</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Estado de la cuenta
-    status = auto_trader.get_status()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("💰 Valor de Cuenta", f"${status['account_value']:,.2f}")
-    
-    with col2:
-        st.metric("💵 Poder de Compra", f"${status['buying_power']:,.2f}")
-    
-    with col3:
-        st.metric("📊 Posiciones Abiertas", status['open_positions'])
-    
-    with col4:
-        trades_today = status['safety_status']['daily_trades']
-        max_trades = status['safety_status']['max_daily_trades']
-        st.metric("📈 Trades Hoy", f"{trades_today}/{max_trades}")
-    
-    st.markdown("---")
-    
-    # Control del auto-trading
-    col_ctrl1, col_ctrl2 = st.columns([2, 1])
-    
-    with col_ctrl1:
-        st.subheader("⚙️ Control del Sistema")
-        
-        # Toggle auto-trading
-        auto_enabled = st.session_state.get('auto_trading_enabled', False)
-        
-        if auto_enabled:
-            st.success("✅ Auto-Trading ACTIVO - El sistema está operando automáticamente")
-            
-            if st.button("⏸️ PAUSAR Auto-Trading", type="secondary", use_container_width=True):
-                st.session_state.auto_trading_enabled = False
-                st.rerun()
-        else:
-            st.warning("⏸️ Auto-Trading PAUSADO - No se ejecutarán trades automáticos")
-            
-            if st.button("▶️ ACTIVAR Auto-Trading", type="primary", use_container_width=True):
-                st.session_state.auto_trading_enabled = True
-                st.success("✅ Auto-Trading activado!")
-                st.rerun()
-    
-    with col_ctrl2:
-        st.subheader("🛑 Acciones de Emergencia")
-        
-        if st.button("❌ Cerrar TODAS las Posiciones", type="secondary"):
-            if st.checkbox("⚠️ Confirmar cierre de todas las posiciones"):
-                auto_trader.broker.close_all_positions()
-                st.success("✅ Todas las posiciones cerradas")
-                st.balloons()
-        
-        if st.button("🗑️ Cancelar TODAS las Órdenes"):
-            auto_trader.broker.cancel_all_orders()
-            st.success("✅ Todas las órdenes canceladas")
-    
-    st.markdown("---")
-    
-    # Configuración de seguridad
-    with st.expander("⚙️ Configuración de Seguridad"):
-        st.markdown("### Límites de Trading")
-        
-        safety_config = auto_trader.safety.config
-        
-        col_s1, col_s2 = st.columns(2)
-        
-        with col_s1:
-            st.number_input("Max Trades Diarios", 
-                          value=safety_config['max_daily_trades'],
-                          min_value=1, max_value=50,
-                          key='safety_max_trades')
-            
-            st.number_input("Max Pérdida Diaria ($)", 
-                          value=safety_config['max_daily_loss_usd'],
-                          min_value=100, max_value=10000,
-                          key='safety_max_loss')
-            
-            st.number_input("Consensus Score Mínimo", 
-                          value=safety_config['min_consensus_score'],
-                          min_value=50, max_value=95,
-                          key='safety_min_score')
-        
-        with col_s2:
-            st.number_input("Max Posiciones Abiertas", 
-                          value=safety_config['max_open_positions'],
-                          min_value=1, max_value=20,
-                          key='safety_max_positions')
-            
-            st.number_input("Tamaño Max de Posición (%)", 
-                          value=safety_config['max_position_size_pct'],
-                          min_value=1.0, max_value=50.0,
-                          key='safety_max_size')
-            
-            st.number_input("Confianza Mínima (%)", 
-                          value=safety_config['min_confidence'],
-                          min_value=50, max_value=95,
-                          key='safety_min_conf')
-        
-        if st.button("💾 Guardar Configuración"):
-            # Actualizar config
-            auto_trader.safety.config['max_daily_trades'] = st.session_state.safety_max_trades
-            auto_trader.safety.config['max_daily_loss_usd'] = st.session_state.safety_max_loss
-            auto_trader.safety.config['min_consensus_score'] = st.session_state.safety_min_score
-            auto_trader.safety.config['max_open_positions'] = st.session_state.safety_max_positions
-            auto_trader.safety.config['max_position_size_pct'] = st.session_state.safety_max_size
-            auto_trader.safety.config['min_confidence'] = st.session_state.safety_min_conf
-            
-            auto_trader.safety.save_config()
-            st.success("✅ Configuración guardada")
-    
-    st.markdown("---")
-    
-    # Posiciones en Alpaca
-    st.subheader("📊 Posiciones en Alpaca")
-    
-    alpaca_positions = auto_trader.broker.get_all_positions()
-    
-    if alpaca_positions:
-        df_alpaca = pd.DataFrame(alpaca_positions)
-        st.dataframe(df_alpaca, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay posiciones abiertas en Alpaca")
-    
-    st.markdown("---")
-    
-    # Log de trades
-    st.subheader("📜 Historial de Auto-Trades")
-    
-    if auto_trader.trade_log:
-        df_log = pd.DataFrame(auto_trader.trade_log)
-        st.dataframe(df_log, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay trades ejecutados aún")
-
-# ============================================================================
-# TAB 9: PAIRS TRADING (ARBITRAJE ESTADÍSTICO)
-# ============================================================================
-with tab9:
-    st.header("⚖️ Estrategia de Arbitraje Estadístico")
-    st.markdown("*Market-Neutral: Gana con la convergencia de dos activos cointegrados.*")
-
-    # 1. Selección de Par
-    col_p1, col_p2 = st.columns([1, 2])
-    with col_p1:
-        st.subheader("🛠️ Configuración")
-        classic_pairs = [f"{p[0]} - {p[1]}" for p in get_classic_pairs()]
-        par_seleccionado = st.selectbox("Seleccionar Par Clásico:", classic_pairs)
-        t1, t2 = par_seleccionado.split(" - ")
-        
-        periodo_pairs = st.selectbox("Periodo de Análisis:", ["1y", "2y", "5y"], index=0)
-        
-    # 2. Carga de Datos y Análisis
-    if st.button("🚀 Analizar Par de Arbitraje", use_container_width=True):
-        with st.spinner(f"Analizando cointegración entre {t1} y {t2}..."):
-            # Obtener datos de ambos activos
-            d1 = fetcher.get_portfolio_data([t1], period=periodo_pairs)[t1]
-            d2 = fetcher.get_portfolio_data([t2], period=periodo_pairs)[t2]
-            
-            if not d1.empty and not d2.empty:
-                # Asegurar que tengan el mismo tamaño
-                common_index = d1.index.intersection(d2.index)
-                s1, s2 = d1.loc[common_index, 'Close'], d2.loc[common_index, 'Close']
-                
-                # Inicializar herramientas
-                finder = PairsFinder()
-                trader = PairsTrader()
-                
-                # Calcular Cointegración
-                pair_stats = finder._calculate_pair_stats(s1, s2, t1, t2)
-                spread = trader.calculate_spread(s1, s2, pair_stats['hedge_ratio'])
-                z_score = trader.calculate_z_score(spread)
-                
-                # 3. Visualización
-                st.markdown("---")
-                c_m1, c_m2, c_m3 = st.columns(3)
-                c_m1.metric("Hedge Ratio (Beta)", f"{pair_stats['hedge_ratio']:.4f}")
-                c_m2.metric("Half-Life (Reversión)", f"{pair_stats['half_life']:.1f} días")
-                c_m3.metric("Z-Score Actual", f"{z_score.iloc[-1]:.2f}")
-                
-                # Gráfico de Z-Score
-                st.subheader("📉 Z-Score del Spread")
-                fig_z = go.Figure()
-                fig_z.add_trace(go.Scatter(x=z_score.index, y=z_score, name="Z-Score", line=dict(color='#00ff88')))
-                # Líneas de umbral
-                fig_z.add_hline(y=2, line_dash="dash", line_color="red", annotation_text="Vender Par")
-                fig_z.add_hline(y=-2, line_dash="dash", line_color="green", annotation_text="Comprar Par")
-                fig_z.add_hline(y=0, line_color="white", opacity=0.3)
-                fig_z.update_layout(template="plotly_dark", height=400)
-                st.plotly_chart(fig_z, use_container_width=True)
-                
-                # 4. Señal Actual
-                signal = trader.generate_signals(t1, t2, s1, s2, pair_stats['hedge_ratio'])
-                
-                st.markdown("---")
-                st.subheader("🎯 Señal de Ejecución")
-                
-                color_sig = "#27ae60" if "LONG" in signal['signal'] else "#e74c3c" if "SHORT" in signal['signal'] else "#95a5a6"
-                st.markdown(f"""
-                <div style='padding: 20px; background-color: {color_sig}20; border-radius: 10px; border-left: 5px solid {color_sig};'>
-                    <h2 style='margin:0; color:{color_sig};'>{signal['signal']}</h2>
-                    <p style='font-size:18px;'>{signal['details']}</p>
-                    <p><b>Fuerza:</b> {signal['signal_strength']} | <b>Tamaño Sugerido:</b> {signal['position_size_pct']}% del capital</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # 5. Backtest del Par
-                with st.expander("🧪 Ver Backtest Histórico del Par"):
-                    bt_res = trader.backtest_pair(t1, t2, s1, s2, pair_stats['hedge_ratio'])
-                    if 'error' not in bt_res:
-                        c_b1, c_b2, c_b3 = st.columns(3)
-                        c_b1.metric("Win Rate", f"{bt_res['win_rate']:.1f}%")
-                        c_b2.metric("Profit Factor", f"{bt_res['profit_factor']:.2f}")
-                        c_b3.metric("Retorno Total", f"{bt_res['total_return']:.2f}%")
-                        st.dataframe(pd.DataFrame([bt_res]), use_container_width=True)
-            else:
-                st.error("No se pudieron obtener datos para uno de los activos.")
-
 # ============================================================================
 # 🤖 PASO C: MACHINE LEARNING (PÉGALO AQUÍ AHORA)
 # ============================================================================
@@ -2023,40 +1659,9 @@ if st.sidebar.button("🧠 Entrenar LSTM (Deep Learning)"):
             st.sidebar.error(f"❌ Error: {str(e)}")
             st.sidebar.caption("Verifica que ml_model_lstm.py esté en tu repo")
 
-# ============================================================================
-# SISTEMA AUTÓNOMO DE MONITOREO
-# ============================================================================
-
-st.sidebar.markdown("---")
-st.sidebar.header("🤖 Sistema Autónomo")
-
-# Configurar sistema de monitoreo automático
-if 'auto_monitor' not in st.session_state:
-    st.session_state.auto_monitor = setup_auto_monitoring(
-        st=st,
-        watchlist=lista_completa,
-        fetcher=fetcher,
-        analyzer=analyzer,
-        ml_models=st.session_state.ml_models,
-        portfolio_tracker=portfolio_tracker
-    )
-
-# Mostrar controles del sistema autónomo
-display_monitoring_controls(st, st.session_state.auto_monitor)
-
-# Mostrar análisis en caché (opcional)
-if st.sidebar.checkbox("📊 Ver Análisis en Caché"):
-    st.sidebar.caption("Últimos análisis automáticos:")
-    
-    for ticker_cached in lista_completa[:5]:
-        cached = st.session_state.auto_monitor.get_latest_analysis(ticker_cached)
-        if cached:
-            age_seconds = (datetime.now() - datetime.fromisoformat(cached['timestamp'])).seconds
-            minutes_ago = age_seconds // 60
-            seconds_ago = age_seconds % 60
-            
-            st.sidebar.caption(f"• {ticker_cached}: {minutes_ago}m {seconds_ago}s ago")
-
+# NOTA (limpieza v4): el "Sistema Autónomo de Monitoreo" (auto_monitoring.py,
+# no existe en este repo) se removió de este dashboard manual. El monitoreo
+# autónomo real vive en scheduler.py (corre 24/7 fuera de Streamlit).
 
 # --- SWITCH MAESTRO DE DATOS ---
 st.sidebar.markdown("---")
@@ -2067,25 +1672,10 @@ usa_tiempo_real = st.sidebar.toggle(
     help="Si se apaga, usa Yahoo Finance por defecto."
 )
 st.session_state.use_realtime = usa_tiempo_real
-auto_monitor = st.sidebar.checkbox("🔔 Alertas Proactivas", value=False)
 
-# El monitor debe ejecutarse siempre que esté activo, sin importar la pestaña
-if auto_monitor:
-    last_signal_key = f"last_alert_{ticker}"
-    current_rec = analysis['signals']['recommendation']
-    
-    # IMPORTANTE: Todo este bloque debe estar indentado dentro de 'if auto_monitor'
-    if "FUERTE" in current_rec:
-        if st.session_state.get(last_signal_key) != current_rec:
-            with st.sidebar:
-                with st.spinner("Enviando alerta en tiempo real..."):
-                    # Llamada al gestor de notificaciones modular
-                    notifier.send_signal_alert(ticker, analysis)
-                    st.session_state[last_signal_key] = current_rec
-                    st.toast(f"🚀 Alerta enviada: {ticker} - {current_rec}")
-                    st.success(f"🔔 Alerta de {current_rec} emitida.")
-    else:
-        st.sidebar.info("🛰️ Monitoreando... Esperando señal fuerte.")
+# NOTA (limpieza v4): las "Alertas Proactivas" dependían de notifications.py
+# (no existe en este repo) — removidas de este dashboard manual. Las alertas
+# reales (Telegram/email) las envía scheduler.py del lado del servidor.
 
 # ============================================================================
 # AUTO-REFRESH DEL SCANNER
