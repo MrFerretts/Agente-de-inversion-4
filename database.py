@@ -239,6 +239,35 @@ def get_top_picks(n: int = 5) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ML SIGNALS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_ml_signal(ticker: str, probability: float, signal: str = None,
+                    model_type: str = "ensemble", features: Dict = None):
+    import json
+    execute("""
+        INSERT INTO ml_signals (ticker, signal, probability, model_type, features)
+        VALUES (%s,%s,%s,%s,%s)
+    """, (ticker, signal, probability, model_type, json.dumps(features or {})))
+
+
+def get_recent_ml_signals(ticker: str = None, hours: int = 24) -> pd.DataFrame:
+    if ticker:
+        return query_df("""
+            SELECT ticker, timestamp, signal, probability, model_type, features
+            FROM ml_signals
+            WHERE ticker = :ticker AND timestamp >= NOW() - INTERVAL :interval
+            ORDER BY timestamp DESC
+        """, {"ticker": ticker, "interval": f"{hours} hours"})
+    return query_df("""
+        SELECT ticker, timestamp, signal, probability, model_type, features
+        FROM ml_signals
+        WHERE timestamp >= NOW() - INTERVAL :interval
+        ORDER BY timestamp DESC
+    """, {"interval": f"{hours} hours"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ALERTAS
 # ─────────────────────────────────────────────────────────────────────────────
 

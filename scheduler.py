@@ -117,7 +117,21 @@ class Database:
         return db_supabase.get_ticker_history(ticker, days)
 
     def save_ml_signal(self, ticker: str, prediction: Dict):
-        pass
+        if not prediction:
+            return
+        db_supabase.save_ml_signal(
+            ticker=ticker,
+            probability=prediction.get("probability_up"),
+            signal=prediction.get("recommendation"),
+            model_type="ensemble",
+            features={
+                "confidence":      prediction.get("confidence"),
+                "confidence_level": prediction.get("confidence_level"),
+                "threshold":       prediction.get("threshold"),
+                "model_accuracy":  prediction.get("model_accuracy"),
+                "model_agreement": prediction.get("model_agreement"),
+            },
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +331,38 @@ class QuantScheduler:
         except Exception as e:
             logger.error(f"❌ Error cargando modelos: {e}")
 
+    def ensure_ml_models(self):
+        """
+        Entrena de inmediato los modelos que falten al arrancar.
+
+        FIX: antes el primer entrenamiento solo ocurría vía el job programado
+        cada `ml_retrain_hours` (24h) — en un deploy fresco de Railway (o tras
+        cualquier restart si data/models no está en un volumen persistente),
+        self.ml_models quedaba vacío hasta un día después. Durante esa ventana
+        el ML no aportaba nada a las decisiones ("ML=0%" en todos los trades).
+        Llamar esto una vez al arrancar, antes del primer scan, para que el
+        ML esté disponible desde el ciclo 1.
+        """
+        watchlist = self.db.get_watchlist()
+        faltantes = [item["ticker"] for item in watchlist
+                     if item["ticker"] not in self.ml_models]
+
+        if not faltantes:
+            logger.info("🤖 Todos los modelos ML ya están cargados.")
+            return
+
+        logger.info(f"🎓 Entrenando {len(faltantes)} modelos ML faltantes al arrancar...")
+        for ticker in faltantes:
+            try:
+                data = self.fetcher.get_stock_data(ticker, period="1y")
+                if data is not None and len(data) >= 200:
+                    data_p = DataProcessor.prepare_full_analysis(data, self.analyzer)
+                    self.train_and_save_model(ticker, data_p)
+                else:
+                    logger.warning(f"⚠️  {ticker}: datos insuficientes para entrenar ML al arrancar")
+            except Exception as e:
+                logger.error(f"❌ Entrenamiento inicial falló para {ticker}: {e}")
+
     def train_and_save_model(self, ticker: str, data: pd.DataFrame):
         try:
             import pickle
@@ -418,6 +464,11 @@ class QuantScheduler:
         signals   = DataProcessor.get_latest_signals(data_processed)
         ml_result = self._get_ml_prediction(ticker, data_processed)
 
+        # Persistir la señal ML en Supabase (ml_signals) — antes se calculaba
+        # pero nunca se guardaba, por eso la tabla estaba siempre vacía.
+        if ml_result:
+            self.db.save_ml_signal(ticker, ml_result)
+
         result = {
             "ticker":         ticker,
             "category":       category,
@@ -435,6 +486,12 @@ class QuantScheduler:
             "ml_prob_up":     ml_result.get("probability_up") if ml_result else None,
             "ml_rec":         ml_result.get("recommendation") if ml_result else None,
             "scanned_at":     datetime.now(pytz.timezone(CONFIG["timezone"])).isoformat(),
+            # FIX: antes no se pasaba "extra", así que raw_data en Supabase
+            # quedaba siempre vacío pese a tener la predicción ML disponible.
+            "extra": {
+                "ml_prob_up": ml_result.get("probability_up") if ml_result else None,
+                "ml_rec":     ml_result.get("recommendation") if ml_result else None,
+            },
         }
 
         logger.info(
@@ -614,6 +671,7 @@ class QuantScheduler:
         logger.info("═"*50)
 
         self.load_ml_models()
+        self.ensure_ml_models()
         self.setup_schedule()
 
         logger.info("⚡ Ejecutando primer scan...")
