@@ -884,7 +884,8 @@ class AutonomousTrader:
                 if order:
                     self.brain.log_trade(ticker, "SELL", qty, price, reason)
                     self._notify_trade(ticker, "VENTA", qty, price, pnl_pct, reason)
-                    self._save_trade_db(ticker, "SELL", qty, price, pnl_pct, reason)
+                    self._save_trade_db(ticker, "SELL", qty, price, pnl_pct, reason,
+                                        order_id=order.get("id"))
 
                     # Registrar en performance tracker
                     if self.perf_tracker:
@@ -971,7 +972,8 @@ class AutonomousTrader:
                     self._notify_trade(ticker, "COMPRA", qty, price, 0, reason,
                                        stop_loss=stop_loss, take_profit=take_profit)
                     self._save_trade_db(ticker, "BUY", qty, price, 0, reason,
-                                        stop_loss=stop_loss, take_profit=take_profit)
+                                        stop_loss=stop_loss, take_profit=take_profit,
+                                        order_id=order.get("id"))
                     entries_this_cycle += 1
 
         if entries_this_cycle == 0:
@@ -1038,20 +1040,19 @@ class AutonomousTrader:
 
     def _save_trade_db(self, ticker: str, action: str, qty: float,
                         price: float, pnl_pct: float, reason: str,
-                        stop_loss: float = None, take_profit: float = None):
-        """Guarda la operación en Supabase."""
+                        stop_loss: float = None, take_profit: float = None,
+                        order_id: str = None):
+        """
+        Guarda la operación en la tabla `trades` de Supabase — fuente de
+        verdad persistente que sobrevive redeploys de Railway, a diferencia
+        de data/performance_history.json (filesystem efímero).
+        """
         try:
-            import json
-            message = json.dumps({
-                "action":      action,
-                "qty":         qty,
-                "price":       price,
-                "pnl_pct":     pnl_pct,
-                "stop_loss":   stop_loss,
-                "take_profit": take_profit,
-                "reason":      reason,
-            })
-            self.db.save_alert(ticker, f"trade_{action.lower()}", message, "alpaca")
+            self.db.save_trade(
+                ticker=ticker, action=action, qty=qty, price=price,
+                pnl_pct=pnl_pct, stop_loss=stop_loss, take_profit=take_profit,
+                reason=reason, order_id=order_id,
+            )
         except Exception as e:
             logger.warning(f"⚠️ No se pudo guardar trade en BD: {e}")
 

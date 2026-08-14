@@ -133,6 +133,19 @@ class Database:
             },
         )
 
+    def save_trade(self, ticker: str, action: str, qty: float, price: float,
+                    pnl_pct: float = None, stop_loss: float = None,
+                    take_profit: float = None, reason: str = None,
+                    order_id: str = None, status: str = "filled"):
+        db_supabase.save_trade(
+            ticker=ticker, action=action, qty=qty, price=price,
+            pnl_pct=pnl_pct, stop_loss=stop_loss, take_profit=take_profit,
+            reason=reason, order_id=order_id, status=status,
+        )
+
+    def get_trades_summary(self) -> Dict:
+        return db_supabase.get_trades_summary()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NOTIFICACIONES
@@ -643,11 +656,42 @@ class QuantScheduler:
         logger.info(f"   → Limpieza BD: diaria a las 02:00")
 
     def _send_daily_performance(self):
-        """Envía reporte diario de performance por Telegram al cierre."""
+        """
+        Envía reporte diario de performance por Telegram al cierre.
+
+        Win rate / profit factor / total trades se leen de la tabla `trades`
+        de Supabase (persistente, sobrevive redeploys) en vez de calcularse
+        solo del JSON local de PerformanceTracker (filesystem efímero de
+        Railway). Equity/drawdown/Sharpe siguen viniendo del JSON local
+        porque requieren la curva de equity diaria, que no vive en `trades`.
+        """
         try:
             metrics = self.perf_tracker.get_metrics()
+            try:
+                trades_summary = self.db.get_trades_summary()
+            except Exception as e:
+                logger.debug(f"No se pudo leer trades_summary de Supabase: {e}")
+                trades_summary = {}
+
             if metrics.get("status") == "insufficient_data":
+                if not trades_summary.get("total_trades"):
+                    return
+                # Fallback: el JSON local se perdió (p.ej. tras un redeploy)
+                # pero Supabase sí tiene el historial real de trades.
+                msg = (
+                    f"📊 *PERFORMANCE DIARIA — Paper Trading (desde Supabase)*\n\n"
+                    f"🎯 Win rate: {trades_summary['win_rate_pct']:.1f}%\n"
+                    f"💹 Profit factor: {trades_summary['profit_factor']:.2f}\n"
+                    f"📋 Trades cerrados: {trades_summary['total_trades']}\n"
+                    f"ℹ️ Equity/drawdown no disponibles (historial local perdido "
+                    f"tras el último redeploy)."
+                )
+                self.notifier.send_telegram(msg, "PERF", "daily_performance")
                 return
+
+            win_rate = trades_summary.get("win_rate_pct", metrics["win_rate_pct"])
+            profit_factor = trades_summary.get("profit_factor", metrics["profit_factor"])
+            total_trades = trades_summary.get("total_trades", metrics["total_trades"])
 
             msg = (
                 f"📊 *PERFORMANCE DIARIA — Paper Trading*\n\n"
@@ -656,9 +700,9 @@ class QuantScheduler:
                 f"📉 Drawdown actual: {metrics['current_drawdown_pct']:.2f}%\n"
                 f"📐 Sharpe: {metrics['sharpe_ratio']:.3f} "
                 f"(30d: {metrics['sharpe_30d']:.3f})\n"
-                f"🎯 Win rate: {metrics['win_rate_pct']:.1f}%\n"
-                f"💹 Profit factor: {metrics['profit_factor']:.2f}\n"
-                f"📋 Trades cerrados: {metrics['total_trades']}\n"
+                f"🎯 Win rate: {win_rate:.1f}%\n"
+                f"💹 Profit factor: {profit_factor:.2f}\n"
+                f"📋 Trades cerrados: {total_trades}\n"
                 f"📅 Días trackeados: {metrics['days_tracked']}"
             )
             self.notifier.send_telegram(msg, "PERF", "daily_performance")
