@@ -112,8 +112,25 @@ def init_tables():
             reason      TEXT,
             score       NUMERIC(8,2)
         )""",
+        """CREATE TABLE IF NOT EXISTS trades (
+            id           SERIAL PRIMARY KEY,
+            ticker       VARCHAR(20)  NOT NULL,
+            action       VARCHAR(10)  NOT NULL,
+            qty          NUMERIC(18,6) NOT NULL,
+            price        NUMERIC(18,4) NOT NULL,
+            value_usd    NUMERIC(18,4) GENERATED ALWAYS AS (qty * price) STORED,
+            pnl_pct      NUMERIC(10,4),
+            stop_loss    NUMERIC(18,4),
+            take_profit  NUMERIC(18,4),
+            reason       TEXT,
+            order_id     VARCHAR(64),
+            status       VARCHAR(20)  NOT NULL DEFAULT 'filled',
+            timestamp    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_scan_ticker_ts ON scan_results (ticker, timestamp DESC)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts_sent (timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_trades_ticker_ts ON trades (ticker, timestamp DESC)",
+        "ALTER TABLE trades ENABLE ROW LEVEL SECURITY",
     ]
     for sql in ddl:
         try:
@@ -315,6 +332,75 @@ def get_agent_log(limit: int = 20) -> pd.DataFrame:
         SELECT timestamp, action, ticker, reason, score
         FROM agent_log ORDER BY timestamp DESC LIMIT :limit
     """, {"limit": limit})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADES (fuente de verdad persistente — sobrevive redeploys de Railway,
+# a diferencia de data/performance_history.json que vive en filesystem efímero)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_trade(ticker: str, action: str, qty: float, price: float,
+                pnl_pct: float = None, stop_loss: float = None,
+                take_profit: float = None, reason: str = None,
+                order_id: str = None, status: str = "filled"):
+    execute("""
+        INSERT INTO trades
+            (ticker, action, qty, price, pnl_pct, stop_loss, take_profit,
+             reason, order_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        ticker, action.upper(), qty, price, pnl_pct, stop_loss, take_profit,
+        reason, order_id, status,
+    ))
+
+
+def get_trades(ticker: str = None, days: int = None, limit: int = 200) -> pd.DataFrame:
+    where = []
+    params = {"limit": limit}
+    if ticker:
+        where.append("ticker = :ticker")
+        params["ticker"] = ticker
+    if days:
+        where.append("timestamp >= NOW() - INTERVAL :interval")
+        params["interval"] = f"{days} days"
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    return query_df(f"""
+        SELECT ticker, action, qty, price, value_usd, pnl_pct, stop_loss,
+               take_profit, reason, order_id, status, timestamp
+        FROM trades
+        {where_sql}
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """, params)
+
+
+def get_trades_summary() -> Dict:
+    """
+    Métricas agregadas calculadas directamente en Supabase — sirven como
+    fuente persistente para performance real (win rate, profit factor),
+    a diferencia de PerformanceTracker que vive en el JSON local efímero.
+    """
+    df = query_df("""
+        SELECT action, qty, price, pnl_pct, timestamp
+        FROM trades
+        WHERE action = 'SELL' AND pnl_pct IS NOT NULL
+    """)
+    if df.empty:
+        return {"total_trades": 0, "win_rate_pct": 0.0, "profit_factor": 0.0,
+                "avg_win_pct": 0.0, "avg_loss_pct": 0.0}
+
+    wins = df[df["pnl_pct"] > 0]
+    losses = df[df["pnl_pct"] <= 0]
+    gross_profit = (wins["pnl_pct"] * wins["qty"] * wins["price"] / 100).sum()
+    gross_loss = abs((losses["pnl_pct"] * losses["qty"] * losses["price"] / 100).sum())
+
+    return {
+        "total_trades": len(df),
+        "win_rate_pct": round(len(wins) / len(df) * 100, 1) if len(df) else 0.0,
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0,
+        "avg_win_pct": round(wins["pnl_pct"].mean(), 2) if not wins.empty else 0.0,
+        "avg_loss_pct": round(losses["pnl_pct"].mean(), 2) if not losses.empty else 0.0,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
