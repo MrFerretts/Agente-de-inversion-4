@@ -119,9 +119,15 @@ class Database:
     def save_ml_signal(self, ticker: str, prediction: Dict):
         if not prediction:
             return
+        prob_up = prediction.get("probability_up")
         db_supabase.save_ml_signal(
             ticker=ticker,
-            probability=prediction.get("probability_up"),
+            # FIX: defensa adicional — probability_up ya viene casteado a
+            # float nativo desde ml_model.py::predict(), pero si algún día
+            # otra fuente de predicción manda un numpy.float64 acá, psycopg2
+            # lo manda como texto literal "np.float64(...)" y Postgres lo
+            # rechaza ("schema np does not exist").
+            probability=float(prob_up) if prob_up is not None else None,
             signal=prediction.get("recommendation"),
             model_type="ensemble",
             features={
@@ -479,8 +485,17 @@ class QuantScheduler:
 
         # Persistir la señal ML en Supabase (ml_signals) — antes se calculaba
         # pero nunca se guardaba, por eso la tabla estaba siempre vacía.
+        # FIX: aislado en su propio try/except — un fallo acá (p.ej. un tipo
+        # que psycopg2 no sepa adaptar) NO debe tumbar el análisis completo
+        # del ticker. Antes, al no estar aislado, una excepción acá se
+        # propagaba hasta el try/except de run_scan() y descartaba el ticker
+        # entero (score, señales, todo) antes de llegar a la decisión de
+        # trading — así se perdían silenciosamente los tickers con modelo ML.
         if ml_result:
-            self.db.save_ml_signal(ticker, ml_result)
+            try:
+                self.db.save_ml_signal(ticker, ml_result)
+            except Exception as e:
+                logger.warning(f"⚠️  No se pudo guardar ml_signal para {ticker}: {e}")
 
         result = {
             "ticker":         ticker,

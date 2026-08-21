@@ -421,18 +421,26 @@ class AdvancedTradingMLModel:
         elif prob_up < 0.40:  recommendation = "VENTA"
         else:                 recommendation = "MANTENER"
 
+        # FIX: sklearn/numpy devuelven numpy.float64/int64, no tipos nativos
+        # de Python. psycopg2 no sabe adaptar numpy.float64 — al insertarlo
+        # en una columna NUMERIC manda literalmente el texto "np.float64(...)"
+        # y Postgres lo rechaza ("schema np does not exist"). Eso tumbaba el
+        # análisis completo del ticker en scheduler.py::_analyze_ticker()
+        # (save_ml_signal se llama antes de construir el resultado, y su
+        # excepción se propagaba). Casteamos todo a tipos nativos acá, en el
+        # origen, para que ningún consumidor de predict() pise esto de nuevo.
         return {
-            'probability_up':        prob_up,
-            'probability_down':      prob_down,
-            'predicted_class':       pred_class,
+            'probability_up':        float(prob_up),
+            'probability_down':      float(prob_down),
+            'predicted_class':       int(pred_class),
             'recommendation':        recommendation,
-            'confidence':            confidence,
+            'confidence':            float(confidence),
             'confidence_level':      confidence_level,
-            'model_agreement':       agreement,
-            'individual_predictions': individual_preds,
+            'model_agreement':       float(agreement),
+            'individual_predictions': {k: float(v) for k, v in individual_preds.items()},
             'prediction_days':       self.prediction_days,
-            'threshold':             self.threshold,
-            'model_accuracy':        self.model_metrics['accuracy'],
+            'threshold':             float(self.threshold),
+            'model_accuracy':        float(self.model_metrics['accuracy']),
             'ensemble_used':         True,
         }
 
